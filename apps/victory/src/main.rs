@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod allocwatch;
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -106,6 +107,11 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Read data and media files as well (terrain, audio, video, textures):
+        /// upstream behaviour, minutes slower and GBs of memory for the few
+        /// containers the title keeps in them.
+        #[arg(long)]
+        all: bool,
     },
     /// Make the host pipelines of every pipeline the title ever created
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
@@ -170,6 +176,7 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    allocwatch::arm();
     // Before the first D3D12 call: puts the carried Agility core in place, or
     // steps aside for the in-box runtime (`sdk::prepare`).
     #[cfg(windows)]
@@ -219,7 +226,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        Command::Shaders { paths, jobs, all } => translate::precompile(paths, jobs, all),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {

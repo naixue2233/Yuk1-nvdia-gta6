@@ -1733,6 +1733,89 @@ impl PlanePass {
     }
 }
 
+/// A device alone, with the two things the translator is told of the host: the
+/// widest wave it runs and whether it is RDNA. For the questions that only a
+/// device can answer (how many views a heap holds, which is part of the shader
+/// cache key) `victory shaders` used to open the whole host, pools and all:
+/// some 6 GB of working set to warm translations, held to the end of the run.
+pub(crate) fn probe() -> Option<ID3D12Device> {
+    static DEVICE: std::sync::OnceLock<Option<ID3D12Device>> = std::sync::OnceLock::new();
+    DEVICE
+        .get_or_init(|| {
+            let mut device: Option<ID3D12Device> = None;
+            // SAFETY: plain device creation; the device is released with the process.
+            unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()? };
+            let device = device?;
+            let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            let asked = unsafe {
+                device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o1).cast(),
+                    size_of_val(&o1) as u32,
+                )
+            };
+            if asked.is_ok() {
+                victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+                let amd = crate::indirect::amd(&device);
+                victory_shader::emit::set_host_rdna(
+                    amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64,
+                );
+            }
+            Some(device)
+        })
+        .clone()
+}
+
+/// Whether [`assume_nvidia`] answered, so that the settings a device would give
+/// the translator are already set: the view-limit probe must not make one then.
+pub(crate) fn assumed() -> bool {
+    ASSUMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static ASSUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The two settings a device would give the translator, for the one vendor whose
+/// answer is known without asking it: NVIDIA runs waves of 32 and holds 1,000,000
+/// views, and refuses the heap past that.
+///
+/// `victory shaders` used to make a device to be told this: on the host this was
+/// measured on, a bare device cost **5.3 GB of working set** (driver mappings,
+/// almost none of it private), held for the whole warming run. Warming 44 small
+/// programs in 2 s does not need a device at all.
+pub(crate) fn assume_nvidia() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        // SAFETY: plain factory creation; released at the end of this block.
+        let Ok(factory) =
+            (unsafe { CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) })
+        else {
+            return false;
+        };
+        // SAFETY: plain factory enumeration; the adapter is released at once.
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(0) }) else {
+            return false;
+        };
+        // SAFETY: the descriptor is written by the adapter.
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            return false;
+        };
+        if desc.VendorId != 0x10DE {
+            return false;
+        }
+        victory_shader::emit::set_host_max_wave(32);
+        victory_shader::emit::set_host_rdna(false);
+        let views = crate::descriptor::host::portable_views();
+        victory_shader::emit::set_view_heap_limit(views - 1);
+        ASSUMED.store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            vendor = "NVIDIA",
+            views,
+            "host settings without a device: waves of 32, the portable view limit"
+        );
+        true
+    })
+}
+
 /// Records into `list` the pass that draws `plane`, the twin of the depth
 /// plane of `depth`, into that plane: `depth` in the depth-write state,
 /// `plane` readable by pixel shaders. The pass sets the list's descriptor

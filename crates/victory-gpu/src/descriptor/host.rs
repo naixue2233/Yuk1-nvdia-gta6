@@ -1735,14 +1735,38 @@ fn raw_twins() -> bool {
 /// the world: a compute program read view slot 16,777,088 (0xffff80) of a
 /// heap of 1,507,328, past its end. Unclamped, that index is undefined on
 /// any host.
+/// The most views a heap is taken to hold on a host that caps them (NVIDIA);
+/// what [`probe_view_limit`] settles on when the driver refuses more.
+pub(crate) fn portable_views() -> u32 {
+    PORTABLE_VIEWS
+}
+
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let Some(host) = host() else { return };
+        // A device would be made for this alone. When the settings are known
+        // already (`host::assume_nvidia`, which the batch translator uses), the
+        // limit is set and no device is needed.
+        if crate::host::assumed() {
+            return;
+        }
+        // `VICTORY_VIEW_PROBE_OFF=1`: take the portable limit without asking the driver
+        // for heaps it will refuse. The heap a driver is asked for and turns down is
+        // still made, backed and touched by it first (some 5 GB of working set on one
+        // NVIDIA host); the batch translator does not need the answer that badly.
+        if std::env::var_os("VICTORY_VIEW_PROBE_OFF").is_some() {
+            tracing::info!(
+                views = PORTABLE_VIEWS,
+                "host view heaps: the portable limit, no heap asked of the driver (VICTORY_VIEW_PROBE_OFF)"
+            );
+            victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
+            return;
+        }
+        let Some(device) = crate::host::probe() else { return };
         let fits = |count: u32| {
             // SAFETY: plain heap creation; the heap is released at once.
             let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-                host.device
+                device
                     .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                         Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                         NumDescriptors: count,

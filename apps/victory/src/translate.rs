@@ -393,53 +393,152 @@ pub fn run(
     Ok(())
 }
 
+/// Extensions no shader container is stored under: terrain tiles and map data, video,
+/// audio, textures and images. Reading those whole (a `.ttpf` is 1.7 GB, and the title
+/// ships 37.5 GB of them) cost minutes and GBs for no container at all; `--all` reads
+/// them anyway, as upstream did.
+const NOT_SHADERS: [&str; 14] = [
+    "ttpf", "ttdb", "ttp", "bik", "bk2", "wem", "awc", "wav", "mp3", "ogg", "dds", "jpg", "jpeg",
+    "png",
+];
+
+/// Bytes of container the walker may hand over ahead of the workers: what bounds the
+/// process's memory, since a file is read whole and its containers are copied out of it.
+const IN_FLIGHT: usize = 256 << 20;
+
+/// A container above this is not a shader (a false `DXBC` in the middle of a data blob);
+/// the largest real ones are a few MB.
+const MAX_CONTAINER: usize = 8 << 20;
+
+fn may_hold_shaders(path: &Path, all: bool) -> bool {
+    if all {
+        return true;
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_none_or(|e| !NOT_SHADERS.iter().any(|n| e.eq_ignore_ascii_case(n)))
+}
+
+/// Containers waiting for a worker, and the bytes they take: the walker waits when they
+/// pass `IN_FLIGHT`, the workers wait when there are none.
+struct Queue {
+    items: std::collections::VecDeque<(String, Vec<u8>)>,
+    bytes: usize,
+    closed: bool,
+}
+
 /// Every shader found into the cache runs translate from.
-pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+///
+/// One walker feeds `threads` workers a bounded queue: the walker reads a file and hands
+/// over its containers, the workers translate, so reading the next file overlaps the
+/// translation and every worker stays busy whatever a single file holds.
+pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, all: bool) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
     let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())).max(1);
     let started = std::time::Instant::now();
-    let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);
     let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
-    for root in &paths {
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let Some(bytes) = job.bytes() else { continue };
-                            let hash = blake3::hash(&bytes);
-                            if !lock(&seen).insert(hash) {
-                                continue;
+    let queue = Mutex::new(Queue { items: std::collections::VecDeque::new(), bytes: 0, closed: false });
+    let ready = std::sync::Condvar::new();
+    let room = std::sync::Condvar::new();
+    let left_out = AtomicUsize::new(0);
+    let left_out_mb = AtomicUsize::new(0);
+    let too_big = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                loop {
+                    let job = {
+                        let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(item) = q.items.pop_front() {
+                                q.bytes -= item.1.len();
+                                room.notify_one();
+                                break Some(item);
                             }
-                            match victory_hle::modules::d3d12x::precompile(&bytes) {
-                                Ok(_) => {
-                                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if n.is_multiple_of(1000) {
-                                        println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
-                                    }
-                                }
-                                Err(why) => {
-                                    let mut failed = lock(&failed);
-                                    failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
-                                }
+                            if q.closed {
+                                break None;
+                            }
+                            q = ready.wait(q).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let Some((hash, bytes)) = job else { return };
+                    match victory_hle::modules::d3d12x::precompile(&bytes) {
+                        Ok(_) => {
+                            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n.is_multiple_of(1000) {
+                                println!(
+                                    "{n} shaders in the cache, {:.0} s",
+                                    started.elapsed().as_secs_f64()
+                                );
                             }
                         }
-                    });
+                        Err(why) => {
+                            let mut failed = lock(&failed);
+                            failed.entry(why).or_insert_with(|| (0, hash)).0 += 1;
+                        }
+                    }
                 }
             });
         }
+        let mut seen = HashSet::new();
+        for root in &paths {
+            for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let size = entry.metadata().map_or(0, |m| m.len());
+                if size > MAX_FILE {
+                    continue;
+                }
+                if !may_hold_shaders(entry.path(), all) {
+                    left_out.fetch_add(1, Ordering::Relaxed);
+                    left_out_mb.fetch_add((size >> 20) as usize, Ordering::Relaxed);
+                    continue;
+                }
+                let Ok(data) = std::fs::read(entry.path()) else {
+                    continue;
+                };
+                for source in sources(&data) {
+                    let Some(bytes) = source.bytes() else { continue };
+                    let hash = blake3::hash(&bytes);
+                    if !seen.insert(hash) {
+                        continue;
+                    }
+                    let container = bytes.into_owned();
+                    if container.len() > MAX_CONTAINER {
+                        too_big.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let hex = hash.to_hex()[..16].to_owned();
+                    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                    while q.bytes + container.len() > IN_FLIGHT && !q.closed {
+                        q = room.wait(q).unwrap_or_else(|e| e.into_inner());
+                    }
+                    q.bytes += container.len();
+                    q.items.push_back((hex, container));
+                    ready.notify_one();
+                }
+            }
+        }
+        let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.closed = true;
+        ready.notify_all();
+        drop(q);
+    });
+    let left_out = left_out.load(Ordering::Relaxed);
+    if left_out > 0 {
+        println!(
+            "{left_out} files of data and media left out ({} MB; --all reads them)",
+            left_out_mb.load(Ordering::Relaxed)
+        );
+    }
+    let too_big = too_big.load(Ordering::Relaxed);
+    if too_big > 0 {
+        println!("{too_big} containers above {MAX_CONTAINER} bytes left out");
     }
     let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
