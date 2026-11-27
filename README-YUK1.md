@@ -35,10 +35,18 @@ supplied at runtime by whoever runs it (see `docs/asset-policy.md` and the
 
 ## Build
 
+`D3D12Core.dll` 1.620.2 ships in this repository at
+`sdk/agility/build/native/bin/x64/D3D12Core.dll` (4,874,024 bytes, Microsoft's
+Agility runtime redistributable — see `sdk/README.md`), so a clone builds
+straight away:
+
 ```powershell
-./scripts/fetch-d3d12-sdk.ps1          # optional: the core the binary embeds
 cargo build --release --bin victory    # target/release/victory.exe
 ```
+
+`scripts/fetch-d3d12-sdk.ps1` is only for re-fetching that file or trying a
+different runtime version (`-Version 1.619.6`). Whatever version it is, it has to
+match `SDK_VERSION` in `apps/victory/src/sdk.rs` (620).
 
 Single file, no VC++ redistributable (the core is embedded and written out at
 runtime):
@@ -48,9 +56,9 @@ $env:RUSTFLAGS = '-C target-feature=+crt-static'
 cargo build --release --bin victory --target-dir target-static
 ```
 
-Without `sdk/agility/.../x64/D3D12Core.dll` the build still succeeds and the
-executable uses the system runtime — which is exactly the case it cannot render
-with, so fetch it.
+If that file is missing the build still succeeds and the executable uses the
+system runtime — which is exactly the case it cannot render with on Windows 10,
+so keep the one in `sdk/`.
 
 ## Run
 
@@ -98,7 +106,8 @@ what each switch actually does.
 
 ## Licence
 
-Upstream's `LICENSE` (GPL-3.0-or-later) applies. The D3D12 Agility runtime embedded in
-`dist/victory.exe` is Microsoft's redistributable
-(`Microsoft.Direct3D.D3D12`, fetched by `scripts/fetch-d3d12-sdk.ps1`); it is not
-part of this repository's source.
+Upstream's `LICENSE` (GPL-3.0-or-later) applies. The D3D12 Agility runtime
+embedded in the executable is Microsoft's redistributable
+(`Microsoft.Direct3D.D3D12` 1.620.2, x64: `sdk/agility/build/native/bin/x64/D3D12Core.dll`,
+Microsoft's own terms, not GPL) and it is kept in this repository only so a clone
+builds without a network round trip.

@@ -34,6 +34,10 @@
 *.obj
 *.exp
 *.ilk
+# The one exception: the D3D12 Agility runtime this build embeds (Microsoft's
+# redistributable, Microsoft.Direct3D.D3D12 1.620.2, x64). See README-YUK1.md and
+# sdk/README.md; `scripts/fetch-d3d12-sdk.ps1` re-fetches it, or another version.
+!/sdk/agility/build/native/bin/x64/D3D12Core.dll
 
 # Console packages and containers
 *.xvd
