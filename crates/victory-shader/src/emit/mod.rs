@@ -740,13 +740,18 @@ fn wave64_refuse() -> bool {
 pub static PAIRED_BEFORE_WIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether console wave64 compute programs may take the paired form ([`paired`]):
-/// `VICTORY_WAVE_PAIRS=0` turns it off (a test can choose for its own thread).
+/// `VICTORY_WAVE_PAIRS=1` turns it on, one program at a time through
+/// `VICTORY_WAVE_PAIRS_ONLY` ([`pairs_here`]). Off unless asked for, as the private
+/// build has it: the paired form adds the two halves' reductions up in an order the
+/// console does not (each half reduces on its own 32 lanes, then the two sums are
+/// added), and a program whose result feeds a classification byte comes out with
+/// hard-edged 16-by-16 patches when that order matters.
 fn pairs_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_PAIRS.get() {
         return on;
     }
-    std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0")
+    std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1")
 }
 
 thread_local! {
@@ -830,13 +835,16 @@ fn wave_wide_here() -> bool {
 
 /// [`pairs_on`] for the program being translated: `VICTORY_WAVE_PAIRS_NOT` leaves a
 /// program out of the paired form, `VICTORY_WAVE_PAIRS_ONLY` keeps the form to the
-/// programs it names.
+/// programs it names. With no list set, the global switch alone decides.
 fn pairs_here() -> bool {
     if listed(pairs_gone()) {
         return false;
     }
     let only = pairs_only();
-    pairs_on() && (only.is_empty() || listed(only))
+    if !only.is_empty() {
+        return listed(only);
+    }
+    pairs_on()
 }
 
 #[cfg(test)]

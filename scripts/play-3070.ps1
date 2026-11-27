@@ -145,11 +145,13 @@ if ($ShaderOpt -ge 0) { $set.VICTORY_SHADER_OPT = "$ShaderOpt" }
 
 # Open water: the title's two 64-lane water programs (VICTORY_WAVE_WIDE_NOT below) come out
 # with black and grey patches when the wave-wide form takes them (the fork's README,
-# 2026-11-27). Left out of it they take the paired form; both are on by default here, and
-# -NoWaterFix runs the stock choice instead.
+# 2026-11-27). Left out of it they take the paired form. -NoWaterFix runs the stock choice.
+#
+# The paired form is NOT forced on every program: its half-wave reductions add up in a
+# different order (lower.rs, join_halves), which is enough to change a shadow tile's
+# classification byte. -PairsFirst asks for it, per program it is VICTORY_WAVE_PAIRS_ONLY.
 if (-not $NoWaterFix) {
     $set.VICTORY_WAVE_WIDE_NOT = '5dc3b25986622949,6f225b641c5b0708'
-    $set.VICTORY_WAVE_PAIRS_FIRST = '1'
 }
 
 foreach ($k in $set.Keys) { Set-Item -Path "Env:$k" -Value $set[$k] }
