@@ -247,8 +247,6 @@ pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, Sha
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
-/// A compute group has 32 KiB of shared memory on the host.
-const HOST_LDS_DWORDS: u32 = 8192;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
 /// `s_sendmsg` id that ends a pixel wave's ordered section.
@@ -481,8 +479,6 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
-    /// Additional dwords reserved by distinct static cross-half exchange sites.
-    private_exchange_dwords: u32,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -1423,7 +1419,7 @@ impl<'a> Lower<'a> {
             if waves > 1 {
                 // `wave_base`'s counter: a dword past the program's LDS, or the program's
                 // first where it takes all a host group has (32 KiB)
-                let slot = if s.lds_dwords < HOST_LDS_DWORDS { s.lds_dwords } else { 0 };
+                let slot = if s.lds_dwords < 8192 { s.lds_dwords } else { 0 };
                 s.lds_dwords = s.lds_dwords.max(slot + 1);
                 halves = Some(slot);
             }
@@ -1730,7 +1726,6 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
-            private_exchange_dwords: 0,
             clane: None,
             pair: None,
             halves,
@@ -4512,11 +4507,12 @@ impl<'a> Lower<'a> {
             return (lo, hi);
         }
         // the pair of dwords of this thread's console wave: its half's, then both
-        let (lds, pair) = self.exchange_storage(at, slot, 2);
+        let pair = self.exchange_pair(slot);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
         let index = self.s.m.bin(at, Bin::Add, pair, half);
+        let lds = self.s.lds();
         let ptr = self.s.m.element(at, lds, index);
         self.s.m.store(at, ptr, mine);
         self.group_sync(at);
@@ -4529,27 +4525,6 @@ impl<'a> Lower<'a> {
         // the slots are written again only after every thread read them
         self.group_sync(at);
         (lo, hi)
-    }
-
-    /// Each static exchange gets its own array while the group has room.
-    /// A broadcast needs one word per logical wave, a pair of partial results needs two.
-    fn exchange_storage(&mut self, at: usize, slot: u32, words_per_wave: u32) -> (V, V) {
-        let pair = self.exchange_pair(slot);
-        let threads = self.s.threads.expect("compute exchange").iter().product::<u32>();
-        let words = words_per_wave * threads.div_ceil(64);
-        if self.s.lds_dwords + self.private_exchange_dwords + words > HOST_LDS_DWORDS {
-            return (self.s.lds(), pair);
-        }
-        let ty = self.s.m.array(words, self.s.t.i32);
-        let lds = self.s.m.global(&format!("wave_exchange_{}", self.private_exchange_dwords), ty, 3);
-        self.private_exchange_dwords += words;
-        let base = self.s.m.i32(slot);
-        let mut index = self.s.m.bin(at, Bin::Sub, pair, base);
-        if words_per_wave == 1 {
-            let one = self.s.m.i32(1);
-            index = self.s.m.bin(at, Bin::LShr, index, one);
-        }
-        (lds, index)
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
@@ -9548,8 +9523,9 @@ impl<'a> Lower<'a> {
                     }
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
-                    let (lds, k) = self.exchange_storage(self.cur, slot, 1);
+                    let k = self.exchange_pair(slot);
                     let at = self.begin_guarded(Some(is));
+                    let lds = self.s.lds();
                     let ptr = self.s.m.element(self.cur, lds, k);
                     self.s.m.store(self.cur, ptr, a);
                     self.end_guarded(at, &[]);

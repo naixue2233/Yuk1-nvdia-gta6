@@ -983,49 +983,6 @@ fn stores(regs: [u32; 4]) -> Vec<u32> {
     w
 }
 
-#[test]
-fn a_later_half_wave_exchange_preserves_an_earlier_unread_result() {
-    let mut words = Vec::new();
-    words.extend(vop3(0x360, 14, v(0), k(5))); // read lane 5
-    words.extend(vop3(0x360, 15, v(0), k(40))); // read lane 40
-    words.push(vop1(1, 7, v(0)));
-    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
-    words.extend([vop1(1, 2, 14), vop1(1, 3, 15), vop1(1, 4, 7)]);
-    words.extend(stores([2, 3, 4, 0]));
-    let native = native(&words);
-    let p = ir::build(&native.code, true, native.vgprs).unwrap();
-    let shader = lowered(&native, &p, &HashSet::new()).unwrap();
-    let Some(text) = super::tests::dump_dxil(&shader.dxil) else {
-        eprintln!("no DXC disassembler");
-        return;
-    };
-    // This group contains one logical wave and the guest declares no LDS. Each
-    // broadcast uses word zero; the reduction writes the two partial results
-    // to words zero and one. Take the arrays from the actual DXIL pointers.
-    let mut arrays = std::collections::HashMap::new();
-    let mut writes = Vec::new();
-    let mut reads = Vec::new();
-    for line in text.lines().map(str::trim) {
-        let Some((op, pointer)) = line.split_once("addrspace(3)* ") else { continue };
-        let pointer = pointer.split(',').next().unwrap();
-        if let Some((result, _)) = op.split_once(" = getelementptr ") {
-            arrays.insert(result, pointer);
-        } else if op.starts_with("store i32 %") {
-            writes.push(arrays[pointer]);
-        } else if op.contains(" = load i32, ") {
-            reads.push(arrays[pointer]);
-        }
-    }
-    let [first, second, reduction] = writes[..] else { panic!("exchange stores: {writes:?}") };
-    let [a, b, lo, hi] = reads[..] else { panic!("exchange loads: {reads:?}") };
-    // Fault injection: issue all three sites' writes before reading any site.
-    let mut lds = std::collections::HashMap::new();
-    for (location, value) in [((first, 0), 5), ((second, 0), 40), ((reduction, 0), 31), ((reduction, 1), 63)] {
-        lds.insert(location, value);
-    }
-    assert_eq!([lds[&(a, 0)], lds[&(b, 0)], lds[&(lo, 0)], lds[&(hi, 1)]], [5, 40, 31, 63]);
-}
-
 /// `native` in the paired form on a host of 32-lane waves, validated by `dxil.dll` when
 /// present. Where no other form gives the host the program (each still asks for 64-lane
 /// waves, or fails), it is also what [`super::emit`] gives it.
