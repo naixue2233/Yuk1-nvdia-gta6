@@ -4,7 +4,8 @@
 > bootstrap (runs on a Windows 10 box whose in-box D3D12 has no Shader Model 6.6
 > heap direct indexing) and a single-file, self-extracting build. What changed,
 > how to build and run it, and the measured numbers are in
-> [README-YUK1.md](README-YUK1.md). The original README follows.
+> [README-YUK1.md](README-YUK1.md); the same thing in Chinese is
+> [README_zh.md](README_zh.md). The original README follows.
 
 A fork of [Op-lite/victory-scarlett](https://github.com/Op-lite/victory-scarlett) (itself based on
 [fxceless/victory-fork](https://github.com/fxceless/victory-fork) and [Marvisak/VIctory](https://github.com/Marvisak/VIctory))

@@ -11,6 +11,8 @@ No game data is here, and none is ever committed: the title's own files are
 supplied at runtime by whoever runs it (see `docs/asset-policy.md` and the
 `.gitignore` rules that the upstream `cargo xtask policy` enforces).
 
+Chinese version of this file, including the same GPU write-up: [README_zh.md](README_zh.md).
+
 ## What is different from upstream
 
 1. **`apps/victory/src/sdk.rs` (new)** — exports `D3D12SDKVersion = 620` and a
@@ -32,6 +34,84 @@ supplied at runtime by whoever runs it (see `docs/asset-policy.md` and the
 6. **`dist/`** — the single-file distribution: `victory.exe` with the runtime
    and a statically linked CRT, `Play-GTA6.cmd`, `victory.env.cmd` (74
    `VICTORY_*` switches), `README.txt` for whoever receives it.
+
+## How the GPU side works
+
+The title is a Scarlett build: it calls the Xbox GDK (`XMemAlloc`, virtual
+drives, dstorage, display/lifecycle) and emits Xbox D3D12 command lists and
+shaders. Nothing here emulates hardware; `victory-hle` answers the GDK calls in
+this process, `victory-loader` brings the title's own executable in, and
+`victory-gpu` translates what the title asks the GPU for into real PC D3D12 calls
+on the Agility runtime. The three pieces that decide the frame rate:
+
+**1. Shaders and root signatures.** The title's DXIL assumes Shader Model 6.6
+with heap direct indexing, so every root signature this renderer builds carries
+`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED` (0xc00) and
+is serialised as `D3D_ROOT_SIGNATURE_VERSION_1_1`
+(`crates/victory-gpu/src/pipeline/host.rs`, `crates/victory-shader/src/emit/host.rs`).
+An in-box Windows 10 `d3d12.dll` (10.0.19041) answers that with
+`Unsupported bit-flag set (root signature flags c00)` and `E_INVALIDARG` for
+every pipeline — which is the crash this fork fixes: the Agility runtime
+implements 6.6, and if it is missing the retry drops the flags instead of the
+pipelines.
+
+**2. Title memory is host memory, and the card gets shadows of it.** A GPU
+resource the title creates lives in the process's own memory. For each one
+`shadow.rs` allocates a *staging* buffer that the CPU can write (that is the
+write-combined shared buffer at `shadow.rs:6027`) and, when the resource is big
+enough, a *card-side* copy in VRAM (`card_for`, `shadow.rs:6031`; with
+`VICTORY_CARD_BUFFERS_MIN_KB=64` that is every buffer). Descriptors the GPU reads
+point at the card copy (`buffer.GetGPUVirtualAddress()`, `shadow.rs:6053`). So the
+GPU never reads title memory directly — except the 185 MB region the renderer
+port places in place (`port.rs`, `OpenExistingHeapFromAddress`).
+
+**3. Per frame, the CPU copies what changed.** The submitting thread walks the
+recorded command lists, asks the write watch which of the title's pages changed,
+and copies only those bytes into the staging buffers. Two paths: buffer copies
+(`Step::Copy` → `copy_mapped`) and the small "fills" (7,000–12,000 a frame, ~500
+bytes each, spread over `wide_each` threads). Then `card_before` records one
+`CopyBufferRegion` per changed range to move staging → VRAM (313 ranges a frame),
+submits, and later copies back the 21–22 MB the shaders wrote, unless
+`VICTORY_WC_NO_BACK=1` leaves write-combined writes on the card.
+
+That copy is the wall on a PC, and it is a memory-type wall, not a thread-count
+one: the CPU writes write-combined memory at about **4.1 GB/s** (66–90 MB a
+frame → 15–40 ms) while the card copies the same bytes out of a shared buffer at
+**19.4 GB/s** (measured by `VICTORY_INPLACE_PROBE=1`: 64 MB in 3.3 ms). More
+threads do nothing — the same 66 MB took 16.3 ms on 7 threads as it did in one
+serial pass — because the bytes and the barrier are the cost.
+
+**Asynchrony.** `VICTORY_RELAY=2` keeps one submission in flight while the next
+is prepared, and `VICTORY_LAND_THREADS` (default 4, we run 8) lands the finished
+pieces. 8 threads made landing 16.4 → 13.2 ms and merge 6.4 → 5.3 ms but did not
+move the frame rate: the submitting thread is still 39–46 ms a frame, and the GPU
+is idle behind it about half the time (`nothing of ours queued … the card idle
+behind us`).
+
+Where a frame goes on a RTX 3080 / Windows 10 (17–22 fps, 45–60 ms):
+
+| part | ms | note |
+|---|---|---|
+| copies + fills into staging | 16–25 | 62–70 MB at ~4 GB/s |
+| card-side recording + hash/compare passes | 6–13 | 313 ranges, 96 hash passes |
+| texture refresh / detile | 2–5 | 27–34 MB |
+| copy-back | 9–19 | 21–22 MB, on another thread |
+| the title's own code, present, waits | ~34 | unchanged by anything here |
+| GPU | 4–25 | what is left over |
+
+So the ceiling for "make the CPU side free" is ~48 ms, 20.8 fps: +33%, and that
+is arithmetic, not pessimism. Two structural answers were tried and both lose on
+this machine — see `RESEARCH-cpu-copies.md` for the numbers:
+
+- `VICTORY_INPLACE=2` (title buffers read by the card in place): copies go to
+  zero, but the GPU's random PCIe reads push it to **341–366 ms a frame** (2.4
+  fps), and the write watch cannot see shader writes there, so the relay has to
+  be off as well.
+- `VICTORY_WC_BAR=1` (CPU-mapped VRAM copy): needs
+  `D3D12_OPTIONS16.GPUUploadHeapSupported`, which this driver reports false; a
+  hand-built `D3D12_HEAP_TYPE_CUSTOM` + `MEMORY_POOL_L1` heap is refused with
+  `E_INVALIDARG` 3,385 times in 150 s. ReBAR is present (BAR1 16 GiB); the
+  runtime/driver combination is what does not offer it.
 
 ## Build
 
