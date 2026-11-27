@@ -206,7 +206,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    // The per-program switches (`VICTORY_WAVE_WIDE_ONLY`, `VICTORY_WAVE_PAIRS_NOT`...) name
+    // programs by the hash this build gives the container, which is what the log's `hash=`
+    // prints and what a shader cache entry is keyed on.
+    let tag = blake3::hash(container).to_hex()[..16].to_owned();
+    let host = victory_shader::emit::with_program(&tag, || {
+        crate::shader_cache::host_shader(container)
+    })?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),

@@ -254,6 +254,46 @@ write-combined 内存且 `VICTORY_WC_NO_BACK=1` 时，整片在更早的地方�
 `VirtualQuery`；关 —— 在游戏的大池子里每次约 2 ms）、`VICTORY_SYNC_FINE`、
 `VICTORY_SPANS_QUICK`。
 
+## 着色器：按程序选形态（水面黑灰斑）
+
+一个 console wave64 的 compute 程序，在只跑 32-lane 波的宿主上有好几种降级形态：deep-skips
+（`without skips, scalars followed`）、local waves、loose LDS、paired、以及 cool_fox 的
+wave-wide。哪个形态先赢，原来只看它能不能翻译通过，不看是哪个程序——于是就出现了
+「形态本身能跑，但某个程序用它算出来是错的」。
+
+最明显的一例是水面：两个 64-lane 水程序
+
+```
+5dc3b25986622949   6f225b641c5b0708
+```
+
+被塞进 wave-wide 形式后，开阔水面是黑灰斑；把它们从这个形式里排掉，水面就是波浪加太阳
+的反光路径（`naixue2233/Victory-naixue2233` 的 README，2026-11-27：
+"the black and grey patches came from forcing the two water programs into the wave-wide
+form. Left out, open water shows waves and the sun's path."）。同理，上游 issue #62 的
+14 个 `CS_ShadowRenderTiled*` 的问题是 deep-skips 形式。
+
+所以这里给了四个按程序选形态的开关，值是 `hash=` 那一列（16 位十六进制，逗号或空格分隔）：
+
+| 开关 | 作用 |
+|---|---|
+| `VICTORY_WAVE_WIDE_NOT` | 这些程序不许用 wave-wide |
+| `VICTORY_WAVE_WIDE_ONLY` | 只有这些程序可以用 wave-wide |
+| `VICTORY_WAVE_PAIRS_NOT` | 这些程序不许用 paired |
+| `VICTORY_WAVE_PAIRS_ONLY` | 只有这些程序可以用 paired |
+
+实现：`crates/victory-shader/src/emit/mod.rs` 里 `with_program(hash, f)` 把当前程序的哈希放进
+thread-local，`wave_wide_here()` / `pairs_here()` 在每个形态闸门前查列表；GPU 侧在
+`crates/victory-gpu/src/pipeline.rs`（运行时翻译）和 `crates/victory-gpu/src/shader_cache.rs`
+（`victory shaders` 预热）两处注入同一个哈希——两边必须一致，否则预热会把没过滤的翻译写进
+缓存被运行时复用。开关名由 `crates/victory-shader/build.rs` 扫描源码生成，自动进 shader
+cache key，所以加开关不需要动缓存版本号。
+
+`scripts/play-3070.ps1` 默认就带上这两个水程序的排除（`-NoWaterFix` 关掉；等价于
+`-Extra "VICTORY_WAVE_WIDE_NOT=5dc3b25986622949,6f225b641c5b0708"`）。要看每个程序到底试了
+哪些形态，加 `VICTORY_WAVE_WHY=1`，stderr 会打 `WAVE64-RETRY <hash> <形态>: wave ...`，被
+列表排掉的程序还会打一行 `WAVE-WIDE-NOT <hash>`。
+
 ## 构建
 
 `D3D12Core.dll` 1.620.2 就放在仓库里：

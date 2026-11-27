@@ -7,6 +7,10 @@ param(
     [int]$Relay = 2,
     [int]$LandThreads = 4,
     [int]$InPlace = 0,
+    [switch]$PairsFirst,
+    [switch]$NoDeepSkips,
+    [switch]$NoWaterFix,
+    [int]$ShaderOpt = -1,
     [switch]$WcBar,
     [switch]$Hooks,
     [switch]$ProbeRays,
@@ -130,6 +134,23 @@ if ($ProbeRays -and -not $RayTracing) {
     $set.VICTORY_AMBIENT_AIR = '1.5'
 }
 if ($RayTracing) { $set.VICTORY_BVH_BUILDER = '1' }
+
+# The form a console wave64 program is translated to. Unset, cool_fox's forms win where
+# they translate and the exact paired form only takes what nothing else did; the 14
+# CS_ShadowRenderTiled* programs then run the approximate forms over 32-lane halves
+# (black 16x16 tiles on lit surfaces, upstream issue #62).
+if ($PairsFirst) { $set.VICTORY_WAVE_PAIRS_FIRST = '1' }
+if ($NoDeepSkips) { $set.VICTORY_WAVE_DEEP_SKIPS = '0' }
+if ($ShaderOpt -ge 0) { $set.VICTORY_SHADER_OPT = "$ShaderOpt" }
+
+# Open water: the title's two 64-lane water programs (VICTORY_WAVE_WIDE_NOT below) come out
+# with black and grey patches when the wave-wide form takes them (the fork's README,
+# 2026-11-27). Left out of it they take the paired form; both are on by default here, and
+# -NoWaterFix runs the stock choice instead.
+if (-not $NoWaterFix) {
+    $set.VICTORY_WAVE_WIDE_NOT = '5dc3b25986622949,6f225b641c5b0708'
+    $set.VICTORY_WAVE_PAIRS_FIRST = '1'
+}
 
 foreach ($k in $set.Keys) { Set-Item -Path "Env:$k" -Value $set[$k] }
 

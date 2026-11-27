@@ -691,13 +691,19 @@ fn emit_any(
         && native.stage == HwStage::Cs
         && native.wave64
         && lower::host_max_wave() == 32
-        && pairs_on()
+        && pairs_here()
     {
         let again = paired(c, native, p, io, res);
         if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
             match &again {
-                Ok((_, wave)) => eprintln!("WAVE64-RETRY paired lanes: wave {wave:?}"),
-                Err(e) => eprintln!("WAVE64-RETRY paired lanes: {e}"),
+                Ok((_, wave)) => eprintln!(
+                    "WAVE64-RETRY {:016x} paired lanes: wave {wave:?}",
+                    PROGRAM_HASH.with(|c| c.get())
+                ),
+                Err(e) => eprintln!(
+                    "WAVE64-RETRY {:016x} paired lanes: {e}",
+                    PROGRAM_HASH.with(|c| c.get())
+                ),
             }
         }
         if let Ok((shader, _)) = again {
@@ -743,6 +749,117 @@ fn pairs_on() -> bool {
     std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0")
 }
 
+thread_local! {
+    /// The title's hash of the program being translated ([`with_program`]), its 16 hex
+    /// digits read as a number: the per-program switches below name programs by it. 0
+    /// outside a translation that named one, which no list then matches.
+    static PROGRAM_HASH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Translate as the program the title calls `hash` (16 hex digits, as the log's `hash=`
+/// gives it): `VICTORY_WAVE_WIDE_ONLY` / `_NOT` and `VICTORY_WAVE_PAIRS_ONLY` / `_NOT`
+/// name programs by it. The GPU side knows the hash and calls this (the fork's own
+/// switches, the reason the two water programs are left out of the wave-wide form).
+pub fn with_program<R>(hash: &str, f: impl FnOnce() -> R) -> R {
+    struct Back(u64);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            PROGRAM_HASH.with(|c| c.set(self.0));
+        }
+    }
+    let tag = u64::from_str_radix(hash, 16).unwrap_or(0);
+    let _back = Back(PROGRAM_HASH.with(|c| c.replace(tag)));
+    f()
+}
+
+/// A switch's list of program hashes (16 hex digits, comma or space separated).
+fn hash_list(name: &'static str) -> std::collections::HashSet<u64> {
+    let Some(value) = std::env::var_os(name) else {
+        return std::collections::HashSet::new();
+    };
+    value
+        .to_string_lossy()
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
+fn wide_only() -> &'static std::collections::HashSet<u64> {
+    static LIST: std::sync::OnceLock<std::collections::HashSet<u64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| hash_list("VICTORY_WAVE_WIDE_ONLY"))
+}
+
+fn wide_not() -> &'static std::collections::HashSet<u64> {
+    static LIST: std::sync::OnceLock<std::collections::HashSet<u64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| hash_list("VICTORY_WAVE_WIDE_NOT"))
+}
+
+fn pairs_only() -> &'static std::collections::HashSet<u64> {
+    static LIST: std::sync::OnceLock<std::collections::HashSet<u64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| hash_list("VICTORY_WAVE_PAIRS_ONLY"))
+}
+
+fn pairs_gone() -> &'static std::collections::HashSet<u64> {
+    static LIST: std::sync::OnceLock<std::collections::HashSet<u64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| hash_list("VICTORY_WAVE_PAIRS_NOT"))
+}
+
+/// Whether the program being translated is one `list` names.
+fn listed(list: &'static std::collections::HashSet<u64>) -> bool {
+    let tag = PROGRAM_HASH.with(|c| c.get());
+    tag != 0 && list.contains(&tag)
+}
+
+/// Whether this program may take the wave-wide form: not named by
+/// `VICTORY_WAVE_WIDE_NOT`, and named by `VICTORY_WAVE_WIDE_ONLY` when that is set. Left
+/// out of the wave-wide form the title's two 64-lane water programs
+/// (`5dc3b25986622949`, `6f225b641c5b0708`) open the water with waves and the sun's path
+/// instead of black and grey patches (the fork's README, 2026-11-27: the patches came
+/// from forcing them into that form; the paired form refuses them as an inexact tree).
+fn wave_wide_here() -> bool {
+    if listed(wide_not()) {
+        // Said once per translation, so a run's own log shows the list took effect.
+        let tag = PROGRAM_HASH.with(|c| c.get());
+        eprintln!("WAVE-WIDE-NOT {tag:016x}: left out of the wave-wide form");
+        return false;
+    }
+    let only = wide_only();
+    only.is_empty() || listed(only)
+}
+
+/// [`pairs_on`] for the program being translated: `VICTORY_WAVE_PAIRS_NOT` leaves a
+/// program out of the paired form, `VICTORY_WAVE_PAIRS_ONLY` keeps the form to the
+/// programs it names.
+fn pairs_here() -> bool {
+    if listed(pairs_gone()) {
+        return false;
+    }
+    let only = pairs_only();
+    pairs_on() && (only.is_empty() || listed(only))
+}
+
+#[cfg(test)]
+mod per_program_lists {
+    use super::*;
+
+    /// The two water programs the fork's README leaves out of the wave-wide form: named by
+    /// `VICTORY_WAVE_WIDE_NOT`, they never take it, and any other program still does.
+    #[test]
+    fn wide_not_leaves_a_program_out() {
+        // The list is read once per process (`OnceLock`), and this is the only test that
+        // sets it, so the order of tests cannot change what it holds.
+        unsafe {
+            std::env::set_var("VICTORY_WAVE_WIDE_NOT", "5dc3b25986622949, 6f225b641c5b0708");
+        }
+        assert!(!with_program("5dc3b25986622949", wave_wide_here));
+        assert!(!with_program("6f225b641c5b0708", wave_wide_here));
+        assert!(with_program("0123456789abcdef", wave_wide_here));
+        // No program named: no list matches, the form is available as before.
+        assert!(wave_wide_here());
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's choice for [`pairs_on`], for its thread only.
@@ -782,9 +899,12 @@ fn emit_forms(
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
+                // The program's hash first, so a form can be tied to the program it was
+                // tried for (`VICTORY_WAVE_WIDE_NOT` and the like name programs by it).
+                let tag = PROGRAM_HASH.with(|c| c.get());
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {tag:016x} {what}: wave {wave:?}"),
+                    Err(e) => eprintln!("WAVE64-RETRY {tag:016x} {what}: {e}"),
                 }
             }
         };
@@ -880,7 +1000,7 @@ fn emit_forms(
                     | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
                     | [0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc, 0xf6]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        let wide_on = wave_wide_here() && wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -904,7 +1024,7 @@ fn emit_forms(
         // last for it (`emit_any`). (`VICTORY_WAVE_PAIRS=0` turns the paired form off here
         // too.)
         let exactly = |approximate: Result<(HostShader, Option<u32>), ShaderError>| {
-            if pairs_on() && pairs_first() {
+            if pairs_here() && pairs_first() {
                 let again = paired(c, native, p, io, res);
                 report("paired lanes, before an approximate form", &again);
                 if again.is_ok() {
@@ -941,7 +1061,7 @@ fn emit_forms(
                     // loops) is tried first for them and the wave-wide form stays their
                     // fallback. Unset (default) or an explicit `VICTORY_WAVE_WIDE=1`:
                     // cool_fox's order.
-                    if wide_option.is_none() && pairs_on() && pairs_first() {
+                    if wide_option.is_none() && pairs_here() && pairs_first() {
                         let again = paired(c, native, p, io, res);
                         report("paired lanes, before cool_fox's wave-wide default", &again);
                         if done(&again) {
@@ -1045,6 +1165,7 @@ fn emit_forms(
         Err(ShaderError::Unsupported { what, .. })
             if native.stage == HwStage::Cs
                 && what == lower::LANE_MASK
+                && wave_wide_here()
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);

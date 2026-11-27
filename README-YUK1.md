@@ -276,6 +276,49 @@ Switches that matter, in one place: `VICTORY_WIDE_FILLS` (default on),
 `VICTORY_COPY_ASK` (a `VirtualQuery` before each copy; off — it cost ~2 ms a copy
 in the title's big pools), `VICTORY_SYNC_FINE`, `VICTORY_SPANS_QUICK`.
 
+## Shaders: choosing a form per program (the black water)
+
+A console wave64 compute program has several forms on a 32-lane host: deep skips
+(`without skips, scalars followed`), local waves, loose LDS, the paired form, and cool_fox's
+wave-wide. Which one wins used to depend only on whether the translation went through, not
+on which program it was — so a form that runs fine could still be the wrong answer for one
+program.
+
+Open water is the clearest case: the title's two 64-lane water programs
+
+```
+5dc3b25986622949   6f225b641c5b0708
+```
+
+come out as black and grey patches once the wave-wide form takes them. Left out of that
+form, open water shows waves and the sun's path (`naixue2233/Victory-naixue2233`'s README,
+2026-11-27). Upstream issue #62 is the same shape of bug for 14 `CS_ShadowRenderTiled*`
+programs and the deep-skips form.
+
+Four switches choose a form per program. Their value is the `hash=` column (16 hex digits,
+comma or space separated):
+
+| Switch | Meaning |
+|---|---|
+| `VICTORY_WAVE_WIDE_NOT` | these programs may not take the wave-wide form |
+| `VICTORY_WAVE_WIDE_ONLY` | only these programs may |
+| `VICTORY_WAVE_PAIRS_NOT` | these programs may not take the paired form |
+| `VICTORY_WAVE_PAIRS_ONLY` | only these programs may |
+
+`with_program(hash, f)` in `crates/victory-shader/src/emit/mod.rs` puts the program's hash in
+a thread-local; `wave_wide_here()` and `pairs_here()` check the lists in front of every form
+gate. The GPU side passes the same hash in two places — `crates/victory-gpu/src/pipeline.rs`
+(the run's translation) and `crates/victory-gpu/src/shader_cache.rs` (`victory shaders`
+warming) — and they have to agree, or a warmed translation would be the unfiltered one the
+run then reuses. `crates/victory-shader/build.rs` scans the sources for the switch names, so
+they join the shader cache key automatically: adding a switch needs no cache version bump.
+
+`scripts/play-3070.ps1` carries the two water exclusions by default (`-NoWaterFix` runs the
+stock choice instead; it is the same as
+`-Extra "VICTORY_WAVE_WIDE_NOT=5dc3b25986622949,6f225b641c5b0708"`). To see what each program
+tried, set `VICTORY_WAVE_WHY=1`: stderr gets `WAVE64-RETRY <hash> <form>: wave ...`, and a
+program a list keeps out gets a `WAVE-WIDE-NOT <hash>` line.
+
 ## Build
 
 `D3D12Core.dll` 1.620.2 ships in this repository at

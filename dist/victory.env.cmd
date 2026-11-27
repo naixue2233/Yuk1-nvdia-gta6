@@ -72,3 +72,7 @@ set "VICTORY_PORT_CONSTANTS=1"
 set "VICTORY_EARLY_DEPTH=1"
 set "VICTORY_AMBIENT=0.8"
 set "VICTORY_AMBIENT_AIR=1.5"
+rem Open water: these two 64-lane water programs come out black and grey in the wave-wide
+rem form; left out of it they take the paired form.
+set "VICTORY_WAVE_WIDE_NOT=5dc3b25986622949,6f225b641c5b0708"
+set "VICTORY_WAVE_PAIRS_FIRST=1"

@@ -87,3 +87,6 @@ Thumbs.db
 game-folder.txt
 /runs/
 /run.log
+
+# stderr/stdout transcripts of a run (run-water.txt, run-why.txt, ...)
+run-*.txt
