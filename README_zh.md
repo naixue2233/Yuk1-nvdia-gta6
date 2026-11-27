@@ -28,7 +28,13 @@ Scarlett 版本的游戏在你自己的 PC 上、用你自己那份拷贝跑起�
    所有管线一起丢掉。
 5. **`scripts/play-3070.ps1`** —— 新增 `-Relay` / `-LandThreads` 参数
    （`VICTORY_RELAY`、`VICTORY_LAND_THREADS`）。
-6. **`dist/`** —— 单文件分发：带内嵌运行时、静态链接 CRT 的 `victory.exe`，
+6. **`crates/victory-gpu/src/inplace.rs`、`shadow.rs:6009`、`host.rs:10928`** —— 上面
+   那两个实验的钩子还留在树里，默认关闭：`VICTORY_INPLACE=2` 现在也会接管被
+   「显存副本」规则判成 big 的 buffer（`(!big || inplace_big)`），并且拒绝与
+   late wait / relay 同时开（`inplace::blocks_waiting`，会警告一次）；
+   `VICTORY_WC_BAR_TRY=1` 在 `GPUUploadHeapSupported` 为假时也照样向驱动要一块
+   CPU 可映射的 L1 堆。两者在本机都不赢，原因见下面那节。
+7. **`dist/`** —— 单文件分发：带内嵌运行时、静态链接 CRT 的 `victory.exe`，
    加上 `Play-GTA6.cmd`、`victory.env.cmd`（74 个 `VICTORY_*` 开关）、
    给接收方的 `README.txt`。
 
@@ -109,6 +115,144 @@ behind us`）。
   `D3D12_OPTIONS16.GPUUploadHeapSupported`，本机驱动报 false；手工构造
   `D3D12_HEAP_TYPE_CUSTOM` + `MEMORY_POOL_L1` 的堆在 150 秒里被 `E_INVALIDARG`
   拒了 3,385 次。ReBAR 是有的（BAR1 16 GiB），是运行时/驱动的组合没开这条路。
+
+## CPU 侧复制是怎么做的
+
+这一段是花掉帧数的部分，值得写清楚。
+
+### 为什么非要有这次拷贝
+
+游戏创建的 GPU 资源不是 D3D12 资源，是它自己 `XMemAlloc` 出来的内存，然后交给
+GPU 用。`crates/victory-gpu/src/shadow.rs` 给每个被跟踪的资源维护两样东西：
+
+- **staging** —— 一份 CPU 可写的共享 buffer，`host()?.shared_buffer(size)?`
+  （`shadow.rs:6027`）。CPU 写的就是它，而且它是 write-combined，下面那个带宽
+  天花板就是它决定的。
+- **显存副本** —— `card_for(size)`（`shadow.rs:6031`）在显存里建的那份；脚本设
+  `VICTORY_CARD_BUFFERS_MIN_KB=64` 时每个 buffer 都有，描述符指向它
+  （`buffer.GetGPUVirtualAddress()`，`shadow.rs:6053`）。
+
+所以每帧 GPU 要读的每个字节都得走：游戏内存 → staging → 显存；GPU 写过的每个
+字节还得走回来。这就是 CPU 侧复制，45–90 ms 的一帧里有 20–40 ms 是它。
+
+### 怎么知道哪些字节变了
+
+- 给游戏内存的页挂写监视；一份提交去问哪些页变了（`crate::watch::ask_once`、
+  `watch::soft_any`），拿回页/区间的位图。
+- 对被监视页的第一次写会缺页，进程的 VEH（`crate::watch::on_write`）记下来。
+  `crates/victory-gpu/src/safecopy.rs` 的存在就是为了让拷贝本身不必每页付一次
+  系统调用：那是一段 `global_asm!`（`safecopy.rs:16`），里有
+  `victory_safe_copy`（`rep movsb`）、`victory_safe_put`
+  （`vpcmpeqd`/`vpmaskmovd`，只写有差异的 dword）、`victory_safe_merge`、
+  `victory_safe_changed`（32 字节比较）；拷到一半撞上未映射页会落回同一个
+  handler，按「短拷贝」返回，不会把进程带走。`read_here`
+  （`host.rs:9689`）在 `safecopy::on()`（`safecopy.rs:380`）为真时用它，否则用
+  `ReadProcessMemory`。
+- 询问本身不便宜，而且是故意不并行的：每帧约 2,300 个被写页 × 约 1.4 µs ≈ 3 ms
+  硬成本；上游量过并行询问反而更慢（`watch.rs:654`："12 to 18 ms where 9 were"）。
+
+### 记录成三种步骤
+
+`crates/victory-gpu/src/host.rs` 里的 `enum Step` 就是全部词汇：
+
+| 步骤 | 是什么 | 谁记下来的 |
+|---|---|---|
+| `Copy(dst, src, len)` | 游戏自己发起的 buffer 拷贝，写进某个资源 | `list.rs:947 buffer_copy` → `host/place.rs:226 place_copy`，否则 `host.rs:7404 defer_copy` |
+| `Fill(dst, src, len, FillTo)` | 游戏内存 → 命令表的 upload 内存（那些小的） | `host.rs:7437 fill_scratch`、`host.rs:7459 defer_fill_buffer`、`host.rs:7451 defer_constants` |
+| `Refresh(Shadow, from, to)` | 把资源 host 副本的一段刷到最新，一份提交只刷一次，谁先要谁刷 | shadow 自己的跟踪 |
+
+`defer_copy` 会试着把相邻两条合成一条：如果上一条 `Copy` 的终点正好是这一条的
+起点（源和目的都对上），`continues(...)` 为真，且开了 `VICTORY_JOIN_COPIES`，
+就把字节数续上去（`host.rs:7404`，计数在 `COPIES_JOINED`）。真实提交上几乎
+不命中：日志自己那行是 `10 copies, of them 0 continue the one before`。
+
+### 落地：`run_deferred`
+
+`host.rs:7886 run_deferred(&self, batch, air, taken)` 遍历步骤：
+
+- `Step::Copy` → `batch.fill()`、`batch.title_written_at(dst, len)`
+  （`host.rs:8866`）、`copy_mapped(dst, src, len, true)`
+  （`host.rs:9451`），然后 `crate::watch::wrote(dst, len)` 与
+  `crate::shadow::send_copied(dst, len)`（`shadow.rs:767`），让同一帧里后面的
+  命令表能看见这次写。
+- `Step::Fill` → wide 模式下只入队（`batch.fills.push(...)`，字节在这里算，
+  时间算在 batch 里）；否则就地 `copy_mapped(..., false)`。
+- `Step::Refresh` → 进 `batch.refreshes`，真正的刷新在 `Batch::flush` 里做。
+- 末尾 `preparing(0, us)` / `preparing(1, bytes)`（`host.rs:780`），就是帧线里
+  `copies … ms … MB` 那两个数。
+
+接着 `Batch::fill()`（`host.rs:9179`）把排队的 fill 摊到常驻线程池上：
+`const FEW: usize = 96; const PART: usize = 64;` —— 少于 96 个就地做（开线程
+更贵），超过就 `crate::shadow::wide_each(fills.len().div_ceil(64), ...)`
+（`shadow.rs:1640`，跑在 `wide_threads()+1` 条线程上，`shadow.rs:1533`：24 核
+→ 7）。`Batch::flush()`（`host.rs:9223` → `flush_all`，`host.rs:9304`）先刷
+纹理，再做 span 过滤：`shadow.nothing_new(address, len)`（`shadow.rs:4306`）把
+游戏可证明没碰过的区间直接扔掉 —— 每帧 7,000–9,700 个里扔掉 6,100–8,900 个 ——
+剩下的在默认的 `VICTORY_WIDE_REFRESH`（≥4 逻辑核即为真）下走同一个池。
+
+### 把字节送到卡上
+
+`host.rs:4647 card_before(&self, declared, picked, flown)` 问
+`crate::shadow::card_dirty(sent_as)`（`shadow.rs:653`）要这次提交送过的片段，然后
+每个区间记一条 `list.CopyBufferRegion(&shadow.buffer, a, staging, a, (b - a) as u64)`
+—— 本机每帧 313 个区间、8.6–11.5 ms，另有 `VICTORY_CARD_REHASH_RUNS=1` 合并的
+hash pass（96 次 over 102 个片段）与 compare pass（357 次）。这个成本是命令
+录制的成本，不是带宽：`card_dirty` 自己只有几个 take/upgrade/take。
+
+### 把字节取回来
+
+反方向是 `shadow.rs:1952 back_piece(...)`，用 `first_difference` /
+`last_difference`（`shadow.rs:1369`，32 字节分块 + 尾部标量）在一个片段里找出
+真正变化的那段，只把那段读回来。每帧 21–22 MB、9–19 ms，由 `wide_back()`
+（`shadow.rs:1498`，除非 `VICTORY_WIDE_BACK=0`）摊到线程上。着色器写的是
+write-combined 内存且 `VICTORY_WC_NO_BACK=1` 时，整片在更早的地方就被丢掉：
+每帧 8–26 GB 留在卡上，不再往回过。
+
+### 在本机的真实成本
+
+| | 每帧 |
+|---|---|
+| `copy_mapped` 的字节量 | 62–93 MB |
+| `copy_mapped` 的时间 | 15–40 ms（约 4.1 GB/s） |
+| fills | 7,000–12,000 个 × 约 500 B，提交线程上 5.3–7.8 ms |
+| 显存侧录制 | 6.6–13.6 ms，313 个区间 |
+| copy-back | 21–22 MB，9–19 ms，在提交线程旁边 |
+| refresh 过滤 | 15.4–19.9 ms，其中 6,100–8,900 个区间已知不拷 |
+
+墙在写这一侧：CPU 写 write-combined 内存大约 **4.1 GB/s**，而显卡从共享 buffer
+拉同样的字节是 **19.4 GB/s**（`VICTORY_INPLACE_PROBE=1`：64 MB 用 3.3 ms）。
+这不是线程数的墙 —— 把一次拷贝切成 1 MiB 分给池子实测 4.06 GB/s，串行是
+4.09 GB/s，所以那个补丁不在本树里。
+
+### 试过不行的
+
+- **把拷贝切宽**（`Step::Copy` 里按 1 MiB 分片给 `wide_each`）：4.06 GB/s vs
+  串行 4.09 GB/s，回退。
+- **`flush_all` 里的 `FEW` 256 → 8**（把那层「已知不拷」的过滤推到 worker）：
+  refreshes 从 18.1 变成 25.8–38.5 ms，`one at a time … before shader writes`
+  从 0.7 变成 4.3–4.9 ms，回退；原因写在那条常量旁的注释里。
+- **`VICTORY_JOIN_COPIES=1`**：10 次拷贝里 0 次能和上一条相接，没得合并。
+- **`VICTORY_CARD_STEPS=2`**（让卡自己做拷贝）：日志里计数是
+  `0.00 fills, 0.00 buffer copies` —— `card_steps` 只挑被在飞写入挡住的步骤
+  （`card_steps.rs:286 plan`，并且受 `const BETWEEN: u64 = 4 << 20` 限制），它
+  消化的是等待，不是批量搬字节。
+- **不拷贝、让卡原地读游戏内存**（`VICTORY_INPLACE=2`）与 **CPU 可映射的显存
+  副本**（`VICTORY_WC_BAR=1`）：本机两条都输，数字见上表和
+  `RESEARCH-cpu-copies.md` —— PCIe 随机读把 GPU 拖到每帧 341–366 ms；驱动报
+  `GPUUploadHeapSupported=false`，手工构造的 L1 堆被 `E_INVALIDARG` 拒。
+- **`VICTORY_WC_BAR_TRY=1`**（无视能力位硬建）：150 秒里被拒 3,385 次，全是
+  `0x80070057`。
+
+还没做、也没量：把 `victory_safe_changed` 放到 fills 前面，字节没变就整条不写。
+这是唯一还剩的「减少字节量」而不是「重排字节」的思路，估计能省 66 MB 里的
+30–50%，但这只是估计。
+
+相关开关一览：`VICTORY_WIDE_FILLS`（默认开）、`VICTORY_PREPARE_WIDE`（关；
+开了从 32 个 fill 起就并行）、`VICTORY_REFRESH_ONCE`、`VICTORY_LIGHT_REFRESH`、
+`VICTORY_WIDE_BACK`（开）、`VICTORY_CARD_REHASH_RUNS`、`VICTORY_WC_NO_BACK`、
+`VICTORY_JOIN_COPIES`、`VICTORY_JOIN_PARTS`、`VICTORY_COPY_ASK`（每次拷贝前先
+`VirtualQuery`；关 —— 在游戏的大池子里每次约 2 ms）、`VICTORY_SYNC_FINE`、
+`VICTORY_SPANS_QUICK`。
 
 ## 构建
 

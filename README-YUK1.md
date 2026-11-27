@@ -31,7 +31,14 @@ Chinese version of this file, including the same GPU write-up: [README_zh.md](RE
    pipeline to a runtime that predates them.
 5. **`scripts/play-3070.ps1`** — `-Relay` / `-LandThreads` parameters
    (`VICTORY_RELAY`, `VICTORY_LAND_THREADS`).
-6. **`dist/`** — the single-file distribution: `victory.exe` with the runtime
+6. **`crates/victory-gpu/src/inplace.rs`, `shadow.rs:6009`, `host.rs:10928`** — the
+   two experiments above are still in the tree, default off: `VICTORY_INPLACE=2`
+   now also takes buffers the card-buffer rule marks big
+   (`(!big || inplace_big)`), refuses to run with late wait / the relay
+   (`inplace::blocks_waiting`, warned once), and `VICTORY_WC_BAR_TRY=1` asks the
+   driver for a CPU-mapped L1 heap even when `GPUUploadHeapSupported` is false.
+   Neither wins on this machine; the section below says why.
+7. **`dist/`** — the single-file distribution: `victory.exe` with the runtime
    and a statically linked CRT, `Play-GTA6.cmd`, `victory.env.cmd` (74
    `VICTORY_*` switches), `README.txt` for whoever receives it.
 
@@ -112,6 +119,162 @@ this machine — see `RESEARCH-cpu-copies.md` for the numbers:
   hand-built `D3D12_HEAP_TYPE_CUSTOM` + `MEMORY_POOL_L1` heap is refused with
   `E_INVALIDARG` 3,385 times in 150 s. ReBAR is present (BAR1 16 GiB); the
   runtime/driver combination is what does not offer it.
+
+## The CPU-side copy
+
+This is the part that costs the frames, so it is worth spelling out.
+
+### Why a copy exists at all
+
+A GPU resource the title creates is not a D3D12 resource: it is memory the title
+allocated for itself (`XMemAlloc` arenas) that the title then hands to the GPU.
+`crates/victory-gpu/src/shadow.rs` keeps two things for every tracked one:
+
+- **staging** — a CPU-writable shared buffer, `host()?.shared_buffer(size)?`
+  (`shadow.rs:6027`). This is the memory the CPU writes, and it is
+  write-combined, which is what sets the bandwidth ceiling below.
+- **the card copy** — a VRAM resource from `card_for(size)` (`shadow.rs:6031`),
+  made for every buffer once `VICTORY_CARD_BUFFERS_MIN_KB=64` (the default in our
+  launcher), with the descriptor pointing at it
+  (`buffer.GetGPUVirtualAddress()`, `shadow.rs:6053`).
+
+So per frame every byte the GPU reads has to travel title memory → staging →
+VRAM, and every byte the GPU wrote has to travel back. That travel is the CPU
+side copy, and it is where 20–40 ms of a 45–90 ms frame goes.
+
+### Deciding what changed
+
+- Pages of title memory are put under a write watch; a submission asks which of
+  them changed (`crate::watch::ask_once`, `watch::soft_any`) and gets the answer
+  as page/range bits.
+- The first write to a watched page faults; the process's VEH
+  (`crate::watch::on_write`) records it. `crates/victory-gpu/src/safecopy.rs`
+  exists so that the copies themselves do not pay a syscall per page: it is a
+  `global_asm!` block (`safecopy.rs:16`) with `victory_safe_copy` (`rep movsb`),
+  `victory_safe_put` (`vpcmpeqd`/`vpmaskmovd`, writes only the dwords that
+  differ), `victory_safe_merge` and `victory_safe_changed` (32-byte compare),
+  and a fault inside them lands in the same handler and is reported back as a
+  short copy instead of taking the process down. `read_here` (`host.rs:9689`)
+  uses it when `safecopy::on()` (`safecopy.rs:380`), otherwise
+  `ReadProcessMemory`.
+- Asking is not free and is not parallelised on purpose: about 2,300 written
+  pages a frame at ~1.4 µs each is ~3 ms of hard cost, and a parallel ask was
+  measured slower upstream (`watch.rs:654`: "12 to 18 ms where 9 were").
+
+### Recording the work: three step kinds
+
+`enum Step` in `crates/victory-gpu/src/host.rs` is the whole vocabulary:
+
+| step | what it is | recorded by |
+|---|---|---|
+| `Copy(dst, src, len)` | the title's own buffer copy into a resource | `list.rs:947 buffer_copy` → `host/place.rs:226 place_copy`, else `host.rs:7404 defer_copy` |
+| `Fill(dst, src, len, FillTo)` | title memory into a list's upload memory — the small ones | `host.rs:7437 fill_scratch`, `host.rs:7459 defer_fill_buffer`, `host.rs:7451 defer_constants` |
+| `Refresh(Shadow, from, to)` | bring a range of a resource's host copy up to date, once per submission, whichever list asks | the shadow's own tracking |
+
+`defer_copy` tries to make one step out of two neighbours — if the previous step's
+`Copy` continues exactly where this one starts (both source and destination),
+`continues(...)` is true and with `VICTORY_JOIN_COPIES` the byte count is simply
+extended (`host.rs:7404`, counters `COPIES_JOINED`). On real submissions this
+almost never fires: the log's own line says
+`10 copies, of them 0 continue the one before`.
+
+### Running them: `run_deferred`
+
+`host.rs:7886 run_deferred(&self, batch, air, taken)` walks the steps and:
+
+- `Step::Copy` → `batch.fill()`, `batch.title_written_at(dst, len)` (`host.rs:8866`),
+  `copy_mapped(dst, src, len, true)` (`host.rs:9451`), then `crate::watch::wrote(dst, len)`
+  and `crate::shadow::send_copied(dst, len)` (`shadow.rs:767`) so later lists in the
+  same frame see the write.
+- `Step::Fill` → in wide mode it is only queued (`batch.fills.push(...)`, bytes
+  counted here, time counted in the batch); otherwise `copy_mapped(..., false)`
+  right away.
+- `Step::Refresh` → `batch.refreshes`; the actual refresh work happens in
+  `Batch::flush`.
+- at the end, `preparing(0, us)` / `preparing(1, bytes)` (`host.rs:780`) feed the
+  two numbers the frame line prints as `copies … ms … MB`.
+
+Then `Batch::fill()` (`host.rs:9179`) spreads the queued fills over the kept-thread
+pool: `const FEW: usize = 96; const PART: usize = 64;` — below 96 fills it does
+them inline (threads would cost more), above that
+`crate::shadow::wide_each(fills.len().div_ceil(64), ...)` (`shadow.rs:1640`, which
+runs on `wide_threads()+1` threads, `shadow.rs:1533`: 24 cores → 7). `Batch::flush()`
+(`host.rs:9223` → `flush_all`, `host.rs:9304`) does the texture refreshes and then
+the span filter: `shadow.nothing_new(address, len)` (`shadow.rs:4306`) throws out
+the ranges the title provably did not touch — 6,100–8,900 of 7,000–9,700 a frame —
+and pushes the rest through the same pool when `VICTORY_WIDE_REFRESH`'s default
+applies (≥4 logical CPUs).
+
+### Getting the bytes onto the card
+
+`host.rs:4647 card_before(&self, declared, picked, flown)` asks
+`crate::shadow::card_dirty(sent_as)` (`shadow.rs:653`) for the pieces this
+submission sent, and records one
+`list.CopyBufferRegion(&shadow.buffer, a, staging, a, (b - a) as u64)` per range —
+313 ranges and 8.6–11.5 ms a frame on this machine, plus the hash passes that
+`VICTORY_CARD_REHASH_RUNS=1` folds together (96 passes over 102 pieces) and the
+compare passes (357). That cost is command recording, not bandwidth: `card_dirty`
+itself is a few take/upgrade/take calls.
+
+### Getting the bytes back
+
+The other direction is `shadow.rs:1952 back_piece(...)`, which uses
+`first_difference`/`last_difference` (`shadow.rs:1369`, 32-byte chunks with a
+scalar tail) to find the changed run inside a piece and reads back only that.
+21–22 MB and 9–19 ms a frame, spread over threads by `wide_back()`
+(`shadow.rs:1498`, on unless `VICTORY_WIDE_BACK=0`). Whole pieces are dropped
+before that when the shader's writes are write-combined and
+`VICTORY_WC_NO_BACK=1`: 8–26 GB a frame stay on the card instead of crossing back.
+
+### What it actually costs here
+
+| | per frame |
+|---|---|
+| `copy_mapped` bytes | 62–93 MB |
+| `copy_mapped` time | 15–40 ms (≈4.1 GB/s) |
+| fills | 7,000–12,000 × ~500 B, 5.3–7.8 ms on the submitting thread |
+| card-side recording | 6.6–13.6 ms, 313 ranges |
+| copy-back | 21–22 MB, 9–19 ms, beside the submitting thread |
+| refresh filtering | 15.4–19.9 ms, of which 6,100–8,900 ranges known to copy nothing |
+
+The wall is the write side: the CPU writes write-combined memory at about
+**4.1 GB/s** while the card pulls the same bytes out of a shared buffer at
+**19.4 GB/s** (`VICTORY_INPLACE_PROBE=1`: 64 MB in 3.3 ms). It is not a
+thread-count wall — splitting one copy into 1 MiB pieces across the pool measured
+4.06 GB/s against 4.09 GB/s serial, which is why that patch is not in this tree.
+
+### What was tried and did not work
+
+- **Wider copies** (1 MiB pieces over `wide_each` in `Step::Copy`):
+  4.06 GB/s vs 4.09 GB/s serial. Reverted.
+- **`FEW` 256 → 8** in `flush_all` (push the "known to copy nothing" filter onto
+  the workers): refreshes went from 18.1 to 25.8–38.5 ms and `one at a time …
+  before shader writes` from 0.7 to 4.3–4.9 ms. Reverted; the reason is in a
+  comment at that constant.
+- **`VICTORY_JOIN_COPIES=1`**: 0 of 10 copies continue the one before, so
+  joining has nothing to join.
+- **`VICTORY_CARD_STEPS=2`** (let the card do the copies): the log counts
+  `0.00 fills, 0.00 buffer copies` because `card_steps` only picks up steps that
+  are blocked behind an in-flight write (`card_steps.rs:286 plan`, and it is
+  bounded by `const BETWEEN: u64 = 4 << 20`), so it swallows waits rather than
+  moving bulk bytes.
+- **Reading title memory in place instead of copying** (`VICTORY_INPLACE=2`) and
+  **a CPU-mapped VRAM copy** (`VICTORY_WC_BAR=1`): both lose here, numbers in
+  `RESEARCH-cpu-copies.md` and above — random PCIe reads took the GPU to 341–366
+  ms a frame, and the driver reports `GPUUploadHeapSupported=false` and refuses a
+  hand-built L1 heap with `E_INVALIDARG`.
+
+Still open, not measured: putting `victory_safe_changed` in front of the fills so
+a fill whose bytes did not change is not written at all. It is the only idea left
+that removes bytes rather than rearranging them; the guess is 30–50% of the 66 MB,
+and it is a guess.
+
+Switches that matter, in one place: `VICTORY_WIDE_FILLS` (default on),
+`VICTORY_PREPARE_WIDE` (off; wide from 32 fills), `VICTORY_REFRESH_ONCE`,
+`VICTORY_LIGHT_REFRESH`, `VICTORY_WIDE_BACK` (on), `VICTORY_CARD_REHASH_RUNS`,
+`VICTORY_WC_NO_BACK`, `VICTORY_JOIN_COPIES`, `VICTORY_JOIN_PARTS`,
+`VICTORY_COPY_ASK` (a `VirtualQuery` before each copy; off — it cost ~2 ms a copy
+in the title's big pools), `VICTORY_SYNC_FINE`, `VICTORY_SPANS_QUICK`.
 
 ## Build
 
