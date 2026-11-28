@@ -4942,35 +4942,55 @@ impl Shadow {
         };
         let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         let start = self.start as usize;
+        // A read of title memory costs a dozen calls of bookkeeping before its bytes (`host::read`),
+        // and a page of 4 KiB paid them on its own: 18,500 times a frame for the 74 MB our copies
+        // take. Whole pages are read together, up to this many bytes at a time.
+        const CHUNK: usize = 64 << 10;
         TITLE.with_borrow_mut(|title| {
-            title.resize(PAGE, 0);
+            title.resize(CHUNK, 0);
             let mut at = from;
             while at < to {
-                let n = (PAGE - at % PAGE).min(to - at);
-                let title = &mut title[..n];
+                // The first page's part of the chunk, then whole pages inside it.
+                let first = (PAGE - at % PAGE).min(to - at);
+                let more = ((to - at - first).min(CHUNK - first)) / PAGE * PAGE;
+                let n = first + more;
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
-                // SAFETY: inside the mapping of the copy's CPU side, which
-                // nothing else reads or writes there (the card copies from
-                // it): no shader's range holds it, and the parts of a
-                // refresh lie apart.
-                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
-                let was = crate::host::upcheck::on().then(|| held.to_vec());
-                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
-                for &(a, len) in &runs {
-                    held[a..a + len].copy_from_slice(&title[a..a + len]);
-                    self.changed(at - start + a, at - start + a + len);
+                let mut off = 0;
+                while off < n {
+                    let len = PAGE.min(n - off);
+                    let (a0, a1) = (at + off, at + off + len);
+                    let title = &mut title[off..off + len];
+                    // SAFETY: inside the mapping of the copy's CPU side, which
+                    // nothing else reads or writes there (the card copies from
+                    // it): no shader's range holds it, and the parts of a
+                    // refresh lie apart.
+                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(a0 - start), len) };
+                    // Most pages a stale set names turn out the same as the copy: one compare of
+                    // whole bytes tells it, where `dword_runs` would look at every dword.
+                    let same = !whole && held == title;
+                    if same {
+                        SEND[1].fetch_add(len as u64, Ordering::Relaxed);
+                    } else {
+                        let was = crate::host::upcheck::on().then(|| held.to_vec());
+                        let runs = if whole { vec![(0, len)] } else { dword_runs(a0, held, title, 0) };
+                        for &(a, l) in &runs {
+                            held[a..a + l].copy_from_slice(&title[a..a + l]);
+                            self.changed(a0 - start + a, a0 - start + a + l);
+                        }
+                        self.card_changed_runs(runs.iter().map(|&(a, l)| (a0 - start + a, a0 - start + a + l)));
+                        if let Some(was) = was {
+                            crate::host::upcheck::note(self.id, a0 - start, &was, held);
+                        }
+                        if runs.is_empty() {
+                            SEND[1].fetch_add(len as u64, Ordering::Relaxed);
+                        }
+                        SEND[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
+                        SEND[3].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                    }
+                    SEND[0].fetch_add(len as u64, Ordering::Relaxed);
+                    off += len;
                 }
-                self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
-                if let Some(was) = was {
-                    crate::host::upcheck::note(self.id, at - start, &was, held);
-                }
-                SEND[0].fetch_add(n as u64, Ordering::Relaxed);
-                if runs.is_empty() {
-                    SEND[1].fetch_add(n as u64, Ordering::Relaxed);
-                }
-                SEND[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
-                SEND[3].fetch_add(runs.len() as u64, Ordering::Relaxed);
                 at += n;
             }
         });

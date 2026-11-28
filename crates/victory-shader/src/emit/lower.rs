@@ -1088,7 +1088,7 @@ fn own_bits_on() -> bool {
 /// host wave's result is its half's sum over the lanes that hold a bit and the halves join as
 /// usual. The title's two 64-lane water programs need it: without it they have no form but
 /// the wave-wide one, whose sums paint 16x16 patches on open water.
-fn divergent_reduce() -> bool {
+pub(super) fn divergent_reduce() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_DIVERGENT_REDUCE").is_some_and(|v| v == "1"))
 }

@@ -66,7 +66,17 @@ impl Lower<'_> {
         } else if self.exchange.is_some() {
             if !self.all_lanes(self.cur_ir) {
                 need(self.cur_ir);
-                return Err("a wave reduction where not every lane runs");
+                // (VICTORY_WAVE_DIVERGENT_REDUCE=1) The two water volumetrics count their
+                // lanes in doubles (`WaveActiveSum(1.0L)`); with the sum refused where not
+                // every lane runs, they had no form but the wave-wide one. The lanes that
+                // hold no bit are already counted as 0.0 ([`Self::masked_double`]), so the
+                // host wave's sum is its half's sum over the lanes that hold a bit, and the
+                // halves add as usual.
+                if !super::divergent_reduce() {
+                    eprintln!("F64-GATE refused block={}", self.cur_ir);
+                    return Err("a wave reduction where not every lane runs");
+                }
+                eprintln!("F64-GATE passed block={}", self.cur_ir);
             }
             let (rl, rh) = self.split_double(r);
             let c = self.cur;

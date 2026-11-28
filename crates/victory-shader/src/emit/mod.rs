@@ -810,6 +810,16 @@ fn pairs_gone() -> &'static std::collections::HashSet<u64> {
     LIST.get_or_init(|| hash_list("VICTORY_WAVE_PAIRS_NOT"))
 }
 
+/// `VICTORY_WAVE_WIDE_ALSO`: programs the wave-wide form is kept open to even when
+/// `VICTORY_WAVE_WIDE_ONLY` narrows the form to a list. Without it, naming a program in
+/// WIDE_ONLY would leave every other program out of the form it needs, which is what the
+/// title's volumetrics needs: the three water programs that only the wave-wide form
+/// translates have to be added one at a time, not by narrowing the form to them.
+fn wide_also() -> &'static std::collections::HashSet<u64> {
+    static LIST: std::sync::OnceLock<std::collections::HashSet<u64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| hash_list("VICTORY_WAVE_WIDE_ALSO"))
+}
+
 /// Whether the program being translated is one `list` names.
 fn listed(list: &'static std::collections::HashSet<u64>) -> bool {
     let tag = PROGRAM_HASH.with(|c| c.get());
@@ -823,6 +833,9 @@ fn listed(list: &'static std::collections::HashSet<u64>) -> bool {
 /// instead of black and grey patches (the fork's README, 2026-11-27: the patches came
 /// from forcing them into that form; the paired form refuses them as an inexact tree).
 fn wave_wide_here() -> bool {
+    if listed(wide_also()) {
+        return true;
+    }
     if listed(wide_not()) {
         // Said once per translation, so a run's own log shows the list took effect.
         let tag = PROGRAM_HASH.with(|c| c.get());
