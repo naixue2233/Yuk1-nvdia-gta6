@@ -1082,6 +1082,17 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_WAVE_DIVERGENT_REDUCE=1`: a wave reduction where not every lane runs takes the
+/// two halves' exchange instead of being refused. Every lane of both halves is at the
+/// instruction (the exchange is a meeting) and carries the identity for its own bit, so the
+/// host wave's result is its half's sum over the lanes that hold a bit and the halves join as
+/// usual. The title's two 64-lane water programs need it: without it they have no form but
+/// the wave-wide one, whose sums paint 16x16 patches on open water.
+fn divergent_reduce() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_DIVERGENT_REDUCE").is_some_and(|v| v == "1"))
+}
+
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
@@ -1504,7 +1515,13 @@ impl<'a> Lower<'a> {
                         if lds_ok {
                             wave = 32;
                             split_lds = s.lds_dwords > 0 && group > 32;
-                            if crosses {
+                            // (`VICTORY_WAVE_NO_EXCHANGE=1`) The half-wave exchange slots of
+                            // `f59783b` hand every static exchange site its own dwords; a program
+                            // whose reduction runs where not every lane runs then refuses the
+                            // forms it used to translate in (5dc3b25986622949, 6f225b641c5b0708,
+                            // the title's two 64-lane water programs). This switch leaves the
+                            // exchange out, which is how those programs got a pipeline before it.
+                            if crosses && std::env::var_os("VICTORY_WAVE_NO_EXCHANGE").is_none_or(|v| v != "1") {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
@@ -2159,7 +2176,16 @@ impl<'a> Lower<'a> {
         } else if self.exchange.is_some() {
             if !self.all_lanes(self.cur_ir) {
                 need(self.cur_ir);
-                return Err("a wave reduction where not every lane runs");
+                // (VICTORY_WAVE_DIVERGENT_REDUCE=1) The console's EXEC is partial here, but the
+                // wave-wide form has every lane of both halves at this instruction (the exchange
+                // is a meeting), each with the identity for its own bit (the select above): the
+                // host wave's reduction is its half's sum over the lanes that hold a bit, and the
+                // two halves join as usual. Left refused, the title's two 64-lane water programs
+                // (5dc3b25986622949, 6f225b641c5b0708) have no form but the wave-wide one, whose
+                // tile sums then come out as 16x16 patches on open water.
+                if !divergent_reduce() {
+                    return Err("a wave reduction where not every lane runs");
+                }
             }
             let bits = |l: &mut Self, v: V| if float { l.as_int(v) } else { v };
             let back = |l: &mut Self, v: V| if float { l.as_float(v) } else { v };

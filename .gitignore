@@ -90,3 +90,6 @@ game-folder.txt
 
 # stderr/stdout transcripts of a run (run-water.txt, run-why.txt, ...)
 run-*.txt
+
+# Screenshots taken while checking a frame
+/shot*.png
