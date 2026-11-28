@@ -156,18 +156,29 @@ if ($ShaderOpt -ge 0) { $set.VICTORY_SHADER_OPT = "$ShaderOpt" }
 
 # Open water: the title's two 64-lane water programs (5dc3b25986622949, 6f225b641c5b0708).
 #
-# Leaving them out of the wave-wide form (VICTORY_WAVE_WIDE_NOT) does not hand them to another
-# form: measured 2026-11-28 on this machine, every form left refused them
-# (converter shader.dxil v1: GFX10 code at 0x0: no wave32 lowering for this wave) and 6f22 got
-# no pipeline at all, so the water surface ran unshaded = black. The wave-wide form is the only
-# one that translates them, and the reason its output used to be wrong -- two half waves sharing
-# one exchange dword -- is fixed by the half-wave exchange slots in lower.rs. So they stay in.
+# Measured 2026-11-28 on this machine: every form but these two left refused them (converter
+# shader.dxil v1: GFX10 code at 0x0: no wave32 lowering for this wave64 program) and 6f22 got no
+# pipeline at all, so the water surface ran unshaded = black. Two switches, both named by program,
+# give them a form:
+#   - their sums are taken under a partial mask (WaveActiveSum over doubles the title counts in),
+#     which the translator refuses unless the program is named: VICTORY_WAVE_DIVERGENT_ONLY;
+#   - they stay out of the wave-wide form, whose half-wave sums painted 16x16 patches on open
+#     water: VICTORY_WAVE_WIDE_NOT.
+# Both lists name the two programs only. Given to every program the same gates make the whole
+# world flicker (a sum over the wrong lanes), measured 2026-11-28.
+#
+# The other two water programs (926c46bab3b86bd6, a10179ab7eda0dc3) translate only in the
+# wave-wide form, so they are added to it one at a time rather than narrowing the form to them
+# (VICTORY_WAVE_WIDE_ONLY would leave every other program without the form it needs):
+# VICTORY_WAVE_WIDE_ALSO.
 #
 # The paired form is NOT forced on every program: its half-wave reductions add up in a
-# different order (lower.rs, join_halves), which is enough to change a shadow tile's
-# classification byte. -PairsFirst asks for it, per program it is VICTORY_WAVE_PAIRS_ONLY.
+# different order (lower.rs, join_halves), enough to change a shadow tile's classification byte.
+# -PairsFirst asks for it; per program it is VICTORY_WAVE_PAIRS_ONLY.
 if (-not $NoWaterFix) {
-    $set.VICTORY_WAVE_WIDE_NOT = ''
+    $set.VICTORY_WAVE_WIDE_NOT = '5dc3b25986622949,6f225b641c5b0708'
+    $set.VICTORY_WAVE_DIVERGENT_ONLY = '5dc3b25986622949,6f225b641c5b0708'
+    $set.VICTORY_WAVE_WIDE_ALSO = 'a10179ab7eda0dc3,926c46bab3b86bd6'
 }
 
 foreach ($k in $set.Keys) { Set-Item -Path "Env:$k" -Value $set[$k] }

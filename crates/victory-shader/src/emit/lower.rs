@@ -1083,14 +1083,20 @@ fn own_bits_on() -> bool {
 }
 
 /// `VICTORY_WAVE_DIVERGENT_REDUCE=1`: a wave reduction where not every lane runs takes the
-/// two halves' exchange instead of being refused. Every lane of both halves is at the
-/// instruction (the exchange is a meeting) and carries the identity for its own bit, so the
-/// host wave's result is its half's sum over the lanes that hold a bit and the halves join as
-/// usual. The title's two 64-lane water programs need it: without it they have no form but
-/// the wave-wide one, whose sums paint 16x16 patches on open water.
+/// two halves' exchange instead of being refused — for every program.
+/// `VICTORY_WAVE_DIVERGENT_ONLY=<hashes>`: the same, for the programs it names only.
+/// Every lane of both halves is at the instruction (the exchange is a meeting) and carries the
+/// identity for its own bit, so the host wave's result is its half's sum over the lanes that
+/// hold a bit and the halves join as usual. The title's two 64-lane water programs need it:
+/// without it they have no form but the wave-wide one, whose sums paint 16x16 patches on open
+/// water. Given to every program it makes the world flicker — a sum taken over the wrong lanes
+/// looks exactly like that from outside — hence the list.
 pub(super) fn divergent_reduce() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_DIVERGENT_REDUCE").is_some_and(|v| v == "1"))
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_DIVERGENT_REDUCE").is_some_and(|v| v == "1")) {
+        return true;
+    }
+    super::divergent_here()
 }
 
 /// What the translator was told of the host, for a cache's key: the widest

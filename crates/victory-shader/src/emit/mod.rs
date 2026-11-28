@@ -860,6 +860,21 @@ fn pairs_here() -> bool {
     pairs_on()
 }
 
+/// `VICTORY_WAVE_DIVERGENT_ONLY`: the programs that may take a reduction under a partial mask
+/// ([`lower::divergent_reduce`]). That gate is a reading of what the console's sum means when
+/// only some lanes hold a bit, so it goes to the programs that have no other form — the title's
+/// two 64-lane water volumetrics — and not to every program: given to all of them, the world
+/// flickers, which is what a sum taken over the wrong lanes looks like from outside.
+pub(crate) fn divergent_only() -> &'static std::collections::HashSet<u64> {
+    static LIST: std::sync::OnceLock<std::collections::HashSet<u64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| hash_list("VICTORY_WAVE_DIVERGENT_ONLY"))
+}
+
+/// Whether the program being translated is one [`divergent_only`] names.
+pub(crate) fn divergent_here() -> bool {
+    listed(divergent_only())
+}
+
 #[cfg(test)]
 mod per_program_lists {
     use super::*;
