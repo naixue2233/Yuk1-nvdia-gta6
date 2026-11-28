@@ -93,3 +93,4 @@ run-*.txt
 
 # Screenshots taken while checking a frame
 /shot*.png
+/*.png
