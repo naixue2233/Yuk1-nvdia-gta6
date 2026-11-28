@@ -13,6 +13,7 @@ victory-pe.workspace = true
 victory-loader.workspace = true
 victory-hle.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
+victory-gpu.workspace = true
 victory-game.workspace = true
 anyhow.workspace = true
 blake3.workspace = true

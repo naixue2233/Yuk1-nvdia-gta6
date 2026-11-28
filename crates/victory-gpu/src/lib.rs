@@ -139,6 +139,12 @@ pub fn frame_phase() -> u32 {
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use shadow::title_memory_write_combined;
+/// What `victory heapwb` prints: a buffer of the PC's memory the CPU writes
+/// as cached memory (`VICTORY_SHARED_WB`), and what the CPU makes of it.
+#[cfg(windows)]
+pub fn write_back_report() -> String {
+    host::Host::write_back_report()
+}
 #[cfg(windows)]
 pub use watch::{
     kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,

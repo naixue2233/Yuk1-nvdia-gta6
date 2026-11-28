@@ -8300,6 +8300,76 @@ mod wide_refresh_tests {
     }
 }
 
+/// (`VICTORY_FILL_STATS=1`) What the fills of the frames so far looked like:
+/// how many, how big, and how many of them continue the fill before in the
+/// same upload buffer with the title's bytes continuing too — the bytes a
+/// copy over the joined range would carry the same way.
+fn fill_stats(fills: &[(usize, usize, usize)]) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static FRAMES: AtomicU64 = AtomicU64::new(0);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static SMALL: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static JOINED: AtomicU64 = AtomicU64::new(0);
+    static JOINED_BYTES: AtomicU64 = AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_FILL_STATS").is_some()) {
+        return;
+    }
+    let mut small = [0u64; 4];
+    let mut bytes = 0u64;
+    for &(_, _, len) in fills {
+        match len {
+            0..=128 => small[0] += 1,
+            129..=512 => small[1] += 1,
+            513..=2048 => small[2] += 1,
+            _ => small[3] += 1,
+        }
+        bytes += len as u64;
+    }
+    let mut order: Vec<(usize, usize, usize)> = fills.to_vec();
+    order.sort_unstable_by_key(|f| (f.0, f.1));
+    let mut joined = 0u64;
+    let mut joined_bytes = 0u64;
+    let mut at = (0usize, 0usize);
+    for &(dst, src, len) in &order {
+        if dst == at.0 && src == at.1 {
+            joined += 1;
+            joined_bytes += len as u64;
+        }
+        at = (dst + len, src + len);
+    }
+    COUNT.fetch_add(order.len() as u64, Relaxed);
+    BYTES.fetch_add(bytes, Relaxed);
+    for i in 0..4 {
+        SMALL[i].fetch_add(small[i], Relaxed);
+    }
+    JOINED.fetch_add(joined, Relaxed);
+    JOINED_BYTES.fetch_add(joined_bytes, Relaxed);
+    let n = FRAMES.fetch_add(1, Relaxed) + 1;
+    if n % 120 != 0 {
+        return;
+    }
+    let count = COUNT.swap(0, Relaxed) as f64 / 120.0;
+    let mb = BYTES.swap(0, Relaxed) as f64 / 120.0 / 1e6;
+    let each = if count > 0.0 { mb * 1e6 / count } else { 0.0 };
+    let small: Vec<f64> = (0..4).map(|i| SMALL[i].swap(0, Relaxed) as f64 / 120.0).collect();
+    let joined = JOINED.swap(0, Relaxed) as f64 / 120.0;
+    let joined_mb = JOINED_BYTES.swap(0, Relaxed) as f64 / 120.0 / 1e6;
+    tracing::info!(
+        "fills per frame: {count:.0} of {mb:.1} MB, {each:.0} bytes each; by size 128 or less {:.0}, 512 or less {:.0}, 2048 or less {:.0}, more {:.0}; continuing the fill before in the same buffer {joined:.0} of {joined_mb:.1} MB",
+        small[0],
+        small[1],
+        small[2],
+        small[3]
+    );
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -9267,6 +9337,7 @@ impl Batch {
             return;
         }
         let started = std::time::Instant::now();
+        fill_stats(&self.fills);
         // (`VICTORY_PREPARE_WIDE=1`) Wide from 32 fills, as the old tree's P6.
         let few = if prepare_wide() { 32 } else { FEW };
         if self.fills.len() < few {
@@ -11015,6 +11086,101 @@ impl Host {
     fn card_mapped_try() -> bool {
         static TRY: OnceLock<bool> = OnceLock::new();
         *TRY.get_or_init(|| std::env::var("VICTORY_WC_BAR_TRY").is_ok_and(|v| v == "1"))
+    }
+
+    /// A buffer of the PC's memory, in a heap the card reads and the CPU
+    /// writes as cached memory (`D3D12_MEMORY_POOL_L0` with write-back
+    /// pages): the CPU writes it at the speed of the PC's memory instead of
+    /// the speed write-combined pages take, and the card reads it over the
+    /// bus as it reads an upload buffer. The runtime takes such a heap on
+    /// integrated parts only, where the assertion says so.
+    pub(crate) fn write_back(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let device = probe()?;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of one buffer.
+        let made = unsafe {
+            device
+                .CreateCommittedResource(
+                    &heap,
+                    not_resident() | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    resident(&device, b)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast::<u8>())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no buffer of the PC's memory the CPU writes cached");
+                None
+            }
+        }
+    }
+
+    /// What `victory heapwb` prints: whether the runtime takes such a buffer,
+    /// how fast the CPU writes it, and how fast it reads it back (the two
+    /// numbers `VICTORY_SHARED_WB` would change the copies to).
+    pub fn write_back_report() -> String {
+        const SIZE: u64 = 64 << 20;
+        let mut out = String::new();
+        match Self::write_back(SIZE) {
+            None => out.push_str(
+                "the runtime refused a buffer of the PC's memory the CPU writes cached (custom heap, pool L0, write-back pages)\n",
+            ),
+            Some((buffer, data)) => {
+                let n = SIZE as usize;
+                let started = std::time::Instant::now();
+                // SAFETY: the mapping is SIZE bytes.
+                unsafe { std::ptr::write_bytes(data, 0xa5, n) };
+                let wrote = started.elapsed();
+                let started = std::time::Instant::now();
+                let mut sum = 0u64;
+                // SAFETY: as above; a cached mapping reads at memory speed.
+                unsafe {
+                    let bytes = std::slice::from_raw_parts(data, n);
+                    for chunk in bytes.chunks(4096) {
+                        sum += chunk[0] as u64;
+                    }
+                }
+                let read = started.elapsed();
+                out.push_str(&format!(
+                    "a buffer of the PC's memory the CPU writes cached: made of {:.0} MB; the CPU writes it at {:.1} GB/s, reads it at {:.1} GB/s (sum {sum})\n",
+                    SIZE as f64 / 1e6,
+                    SIZE as f64 / 1e9 / wrote.as_secs_f64(),
+                    SIZE as f64 / 1e9 / read.as_secs_f64()
+                ));
+                // SAFETY: the mapping made above.
+                unsafe { buffer.Unmap(0, None) };
+            }
+        }
+        out
     }
 
     /// A buffer in the card's own memory that the CPU maps, shaders read and

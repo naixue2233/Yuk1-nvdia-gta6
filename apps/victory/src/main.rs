@@ -161,6 +161,9 @@ enum Command {
     Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
+    /// Try a buffer of the PC's memory the CPU writes as cached memory
+    /// (`VICTORY_SHARED_WB`) and say how fast the CPU writes and reads it.
+    Heapwb,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -243,6 +246,10 @@ fn main() -> Result<()> {
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
+        Command::Heapwb => {
+            print!("{}", victory_gpu::write_back_report());
+            Ok(())
+        }
     }
 }
 

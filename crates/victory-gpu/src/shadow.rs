@@ -2042,6 +2042,56 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
+// (VICTORY_REFRESH_STATS=1) What the refreshes ask for, and how much of that is the very same
+// range asked again in the same window: bytes taken twice are bytes the title did not have to
+// write twice.
+fn refresh_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_STATS").is_some_and(|v| v == "1"))
+}
+
+static RS_ASKED: AtomicU64 = AtomicU64::new(0);
+static RS_REPEAT: AtomicU64 = AtomicU64::new(0);
+static RS_REPEAT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static RS_SEEN: std::cell::RefCell<std::collections::HashSet<(usize, usize, usize)>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+fn refresh_asked(buffer: usize, from: usize, to: usize) {
+    if !refresh_stats() {
+        return;
+    }
+    let repeat = RS_SEEN.with(|s| !s.borrow_mut().insert((buffer, from, to)));
+    let bytes = (to - from) as u64;
+    let calls = RS_ASKED.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    if repeat {
+        RS_REPEAT.fetch_add(1, Ordering::Relaxed);
+        RS_REPEAT_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    }
+    if calls >= (256 << 20) {
+        let asked = RS_ASKED.swap(0, Ordering::Relaxed);
+        let again = RS_REPEAT.swap(0, Ordering::Relaxed);
+        let again_bytes = RS_REPEAT_BYTES.swap(0, Ordering::Relaxed);
+        let distinct = RS_SEEN.with(|s| {
+            let mut s = s.borrow_mut();
+            let n = s.len();
+            s.clear();
+            n
+        });
+        eprintln!(
+            "refreshes asked {:.1} MB in {} ranges, {} of them the same range again ({:.1} MB, {:.0}%), {} distinct",
+            asked as f64 / 1e6,
+            asked.div_ceil(4096),
+            again,
+            again_bytes as f64 / 1e6,
+            100.0 * again_bytes as f64 / asked.max(1) as f64,
+            distinct
+        );
+    }
+}
+
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
@@ -4272,6 +4322,7 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        refresh_asked(self.start as usize, from, to);
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()

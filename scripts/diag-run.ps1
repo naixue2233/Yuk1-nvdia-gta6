@@ -4,7 +4,8 @@ param(
     [int]$Relay = 2,
     [int]$LandThreads = 8,
     [string]$ExeDir = 'target-diag\release',
-    [string]$Tag = 'diag'
+    [string]$Tag = 'diag',
+    [string]$Extra = ''
 )
 # Runs the diagnostics build beside an already running game: no process guard,
 # the same VICTORY_* set as play-3070.ps1, raw cmd redirection so long lines
@@ -16,6 +17,7 @@ if (-not (Test-Path -LiteralPath $Game)) { throw "no game at $Game" }
 
 $keep = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $keep } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
+$env:VICTORY_FILL_STATS = '1'
 
 $gameDir = Split-Path -Parent (Resolve-Path -LiteralPath $Game)
 $set = [ordered]@{
@@ -91,6 +93,7 @@ $set = [ordered]@{
     VICTORY_EARLY_DEPTH = '1'
 }
 foreach ($k in $set.Keys) { Set-Item -Path "Env:$k" -Value $set[$k] }
+if ($Extra) { foreach ($pair in $Extra -split ';') { if (-not $pair) { continue }; $i = $pair.IndexOf('='); if ($i -lt 1) { continue }; Set-Item -Path ("Env:" + $pair.Substring(0, $i).Trim()) -Value $pair.Substring($i + 1).Trim() } }
 
 $runsDir = Join-Path $root 'runs'
 New-Item -ItemType Directory -Force -Path $runsDir | Out-Null
